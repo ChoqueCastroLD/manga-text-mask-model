@@ -141,4 +141,4 @@ What it gets wrong:
 
 ## License
 
-No license has been chosen yet, so default copyright applies.
+[Apache-2.0](LICENSE)
