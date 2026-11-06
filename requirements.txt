@@ -1,0 +1,8 @@
+numpy
+opencv-python-headless
+Pillow
+# Keep one ONNX Runtime package, the one for your machine:
+#   Windows GPU (any vendor): onnxruntime-directml
+#   Linux with an NVIDIA GPU: onnxruntime-gpu
+#   Mac, or CPU anywhere:     onnxruntime
+onnxruntime
