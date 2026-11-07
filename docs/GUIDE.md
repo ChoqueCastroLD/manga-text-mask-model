@@ -35,6 +35,7 @@ The script picks the fastest backend it finds and prints its name when it starts
 ```bash
 python manga_text_mask.py page.png -o out
 python manga_text_mask.py "chapter/*.png" -o out --grow 2 --overlay --json
+python manga_text_mask.py "chapter/*.png" -o out --grow 2 --precise
 ```
 
 | Option | Default | What it does |
@@ -48,7 +49,8 @@ python manga_text_mask.py "chapter/*.png" -o out --grow 2 --overlay --json
 | `--prob` | off | Also write the probability map as a grey PNG |
 | `--tile N` | automatic | Force tiles of N px. N must be a multiple of 32 |
 | `--cpu` | off | Do not use the GPU |
-| `--model PATH` | `model/manga-text-mask.onnx` | Use another copy of the model |
+| `--precise` | off | Use `model/manga-text-mask-precise.onnx`: fewer false detections, less of each giant effect. See [which model](../README.md#which-model) |
+| `--model PATH` | `model/manga-text-mask.onnx` | Use another copy of a model. Not together with `--precise` |
 
 ## Python
 
@@ -56,6 +58,7 @@ python manga_text_mask.py "chapter/*.png" -o out --grow 2 --overlay --json
 from manga_text_mask import MangaTextMask, read_page
 
 model = MangaTextMask()                # or MangaTextMask(providers=["CPUExecutionProvider"])
+                                       # or MangaTextMask(PRECISE_MODEL), imported from the same place
 page = read_page("page.png")           # uint8 RGB array, (H, W, 3)
 
 mask = model.mask(page, grow=2)        # bool array, (H, W)
@@ -111,10 +114,19 @@ For `page.png`:
 
 The network works best on pages between 1500 and 2600 px tall, so the script resizes other pages for it and resizes the result back. The script also does two things after the network: it fills the white body of outlined letters whose outline was traced, and it drops marks with no pixel above 0.8. Without those steps, your results will differ from the numbers in the README.
 
+Both models have this interface. The precise model stores its own settings in the file's metadata, and the script reads them:
+
+| Key | Value | Meaning |
+|---|---|---|
+| `confident` | 0.99 | Drop marks with no pixel above this, instead of 0.8 |
+| `wide_page_max_height` | 2000 | Run wide pages at no more than this height |
+| `wide_page_min_width` | 1200 | A page is wide from this width in px, measured before resizing |
+
 ## Cleaning pages
 
 ```bash
 python examples/clean_page.py page.png clean.png
+python examples/clean_page.py page.png clean.png --precise
 ```
 
 This uses OpenCV's inpainting, which is fine on white paper and flat areas and rough on detailed art. Grow the mask by 2 px before inpainting, because the mask follows the letter closely and the antialiased edge of a letter can otherwise survive as a dark outline.
@@ -139,8 +151,8 @@ Tiling can change the result compared with running the whole page at once, becau
 
 **It runs out of GPU memory.** Use `--tile 1536`. If that is not enough, use a smaller tile such as 1024, or `--cpu`.
 
-**It runs out of RAM on the CPU.** Peak use was about 7 GB on pages up to 2132 × 3200. Use `--tile 1024` to lower it.
+**It runs out of RAM on the CPU.** Peak use on pages up to 2132 × 3200 was about 7 GB with the default model and 4 GB with `--precise`. Use `--tile 1024` to lower it.
 
-**It marks art.** Raise `--threshold`, for example to 0.7. This also loses some text. See the limits in the [README](../README.md#quality-and-limits).
+**It marks art.** Try `--precise`, which also covers less of each giant effect. Or raise `--threshold`, for example to 0.7. This also loses some text. See the limits in the [README](../README.md#quality-and-limits).
 
-**It misses letters.** Lower `--threshold`, for example to 0.3. This also marks more art. Black letters with no outline are a known weak spot.
+**It misses letters.** If you use `--precise`, try the default model. Lower `--threshold`, for example to 0.3. This also marks more art. Black letters with no outline are a known weak spot.

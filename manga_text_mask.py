@@ -4,12 +4,14 @@
 Command line:
     python manga_text_mask.py page.png -o out/
     python manga_text_mask.py pages/*.png -o out/ --grow 2 --overlay --json
+    python manga_text_mask.py page.png -o out/ --precise   # fewer false detections, less of each giant effect
 
 Python:
     from manga_text_mask import MangaTextMask, read_page
     model = MangaTextMask()
     mask = model.mask(read_page("page.png"), grow=2)   # bool array, same size as the page
     mask, labels, regions = model.detect(read_page("page.png"))   # one id per word or effect
+    precise = MangaTextMask(PRECISE_MODEL)
 """
 import argparse
 import glob
@@ -23,6 +25,7 @@ import onnxruntime as ort
 from PIL import Image
 
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "manga-text-mask.onnx")
+PRECISE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "manga-text-mask-precise.onnx")
 
 # The network works on pages of about this height. Other pages are resized for the network only:
 # the result always comes back at the page's own size.
@@ -162,6 +165,11 @@ class MangaTextMask:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(model_path, options, providers=providers or available_providers())
         self.input_name = self.session.get_inputs()[0].name
+        # A model file can carry its own settings. Without them these are the defaults.
+        settings = self.session.get_modelmeta().custom_metadata_map
+        self.confident = float(settings.get("confident", 0.8))
+        self.wide_page_max_height = int(settings.get("wide_page_max_height", 0))
+        self.wide_page_min_width = int(settings.get("wide_page_min_width", 0))
 
     @property
     def backend(self):
@@ -207,6 +215,8 @@ class MangaTextMask:
         tile: force tiles of this size in px; it must be a multiple of 32."""
         H, W = rgb.shape[:2]
         s = MIN_HEIGHT / H if H < MIN_HEIGHT else MAX_HEIGHT / H if H > MAX_HEIGHT else 1.0
+        if self.wide_page_max_height and W >= self.wide_page_min_width and H * s > self.wide_page_max_height:
+            s = self.wide_page_max_height / H
         h, w = round(H * s), round(W * s)
         x = rgb if s == 1 else cv2.resize(rgb, (w, h), interpolation=cv2.INTER_CUBIC if s > 1 else cv2.INTER_AREA)
         T = tile or (TILE_SIZE if h * w > TILE_ABOVE_AREA else 0)
@@ -223,7 +233,7 @@ class MangaTextMask:
         regions: id, box [x0, y0, x1, y1], area and score of each word or effect, in manga reading order.
         grow: expand the mask and the labels outward by this many px, so no dark edge survives cleaning.
         Boxes, areas and scores describe the regions before growing."""
-        labels, regions = find_regions(self.probabilities(rgb, tile), threshold)
+        labels, regions = find_regions(self.probabilities(rgb, tile), threshold, self.confident)
         if grow:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
             labels = cv2.dilate(labels.astype(np.float32), k).astype(np.int32)
@@ -248,7 +258,9 @@ def main():
     ap = argparse.ArgumentParser(description="Find the text and sound effects on manga pages and write them as masks.")
     ap.add_argument("pages", nargs="+", help="image files; wildcards are fine")
     ap.add_argument("-o", "--out", default="out", help="output folder (default: out)")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="path to the .onnx file")
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument("--precise", action="store_true", help="use the second model: fewer false detections, less of each giant effect")
+    which.add_argument("--model", default=DEFAULT_MODEL, help="path to the .onnx file")
     ap.add_argument("--threshold", type=float, default=0.5, help="lower finds more and also marks more art (default: 0.5)")
     ap.add_argument("--grow", type=int, default=0, help="expand the mask outward by N px; 2 suits cleaning (default: 0)")
     ap.add_argument("--tile", type=int, default=None, help="force tiles of N px; try 1536 if the GPU runs out of memory")
@@ -260,7 +272,7 @@ def main():
     a = ap.parse_args()
 
     pages = [p for spec in a.pages for p in (sorted(glob.glob(spec)) or [spec])]
-    model = MangaTextMask(a.model, ["CPUExecutionProvider"] if a.cpu else None)
+    model = MangaTextMask(PRECISE_MODEL if a.precise else a.model, ["CPUExecutionProvider"] if a.cpu else None)
     print(f"running on {model.backend}")
     os.makedirs(a.out, exist_ok=True)
     for path in pages:
