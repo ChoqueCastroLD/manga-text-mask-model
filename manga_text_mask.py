@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 """Find the text and sound effects on a manga page and write them as a mask.
 
+Three models: Shin1, Shin2 and Shin3. Shin1 and Shin2 come with the code. Shin3 is downloaded the first time it is used.
+
 Command line:
-    python manga_text_mask.py page.png -o out/
+    python manga_text_mask.py page.png -o out/                       # Shin1
     python manga_text_mask.py pages/*.png -o out/ --grow 2 --overlay --json
-    python manga_text_mask.py page.png -o out/ --precise   # fewer false detections, less of each giant effect
+    python manga_text_mask.py page.png -o out/ --model shin2         # fewest false detections
+    python manga_text_mask.py page.png -o out/ --model shin3         # most text and giant effects
 
 Python:
     from manga_text_mask import MangaTextMask, read_page
-    model = MangaTextMask()
+    model = MangaTextMask()                   # or MangaTextMask("shin3")
     mask = model.mask(read_page("page.png"), grow=2)   # bool array, same size as the page
     mask, labels, regions = model.detect(read_page("page.png"))   # one id per word or effect
-    precise = MangaTextMask(PRECISE_MODEL)
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import time
+import urllib.request
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "manga-text-mask.onnx")
-PRECISE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "manga-text-mask-precise.onnx")
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+MODELS = {name: os.path.join(MODEL_DIR, name + ".onnx") for name in ("shin1", "shin2", "shin3")}
+DEFAULT_MODEL, PRECISE_MODEL, SHIN3_MODEL = MODELS["shin1"], MODELS["shin2"], MODELS["shin3"]
+
+# Shin3 is kept in a GitHub release, so the repository does not grow by another model.
+SHIN3_URL = "https://github.com/ChoqueCastroLD/manga-text-mask-model/releases/download/shin3/shin3.onnx"
+SHIN3_SHA256 = "a0dc1bf6ce533beec484f61b32986d0c3e67c8d30bd06b11b82782f974c0a3d6"
 
 # The network works on pages of about this height. Other pages are resized for the network only:
 # the result always comes back at the page's own size.
@@ -36,6 +45,13 @@ TILE_SIZE, TILE_OVERLAP, TILE_ABOVE_AREA = 1536, 128, 6.5e6
 
 # Filling the white body of outlined letters.
 FILL_MIN_AREA, FILL_MAX_RATIO, FILL_MIN_WIDTH = 300, 3, 4
+
+# Giant mode, used by models that ask for it (Shin3). A second pass at half the usual height shows a giant effect
+# at the size the network knows best. That pass is merged only where the full-size pass found a piece at least
+# GIANT_MIN_PIECE of the page tall and covers GIANT_MIN_COVER of it. It is never merged deep inside solid black.
+GIANT_SCALE, GIANT_MIN_PIECE, GIANT_MIN_COVER, GIANT_DARK_DEPTH = 0.5, 0.06, 0.3, 8
+# Then the white body of a giant letter is filled when the mask traces at least BODY_RING of the line around it.
+BODY_RING, BODY_BRIGHT, BODY_MIN_SIDE, BODY_MAX_AREA, BODY_REACH, BODY_DOTS, BODY_GRID = 0.8, 200, 1 / 60, 0.12, 9, 4.0, 3
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -93,6 +109,88 @@ def fill_hollow(prob, img, thr=0.5):
             continue
         out[y:y + h, x:x + w][hole] = np.maximum(out[y:y + h, x:x + w][hole], 0.75)
     return out
+
+
+def merge_giant(prob, half, rgb, threshold=0.5):
+    """Adds the half-size pass to the full-size probabilities, only around giant letters. Ordinary text is left alone:
+    at half size a paragraph blurs into one blob that covers the gaps between letters and lines."""
+    H = prob.shape[0]
+    n, lab, st, _ = cv2.connectedComponentsWithStats((half >= threshold).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return prob
+    m = prob >= threshold
+    _, lab1, st1, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    big = np.maximum(st1[:, 2], st1[:, 3]) >= GIANT_MIN_PIECE * H
+    big[0] = False
+    has_big = np.zeros(n, bool)
+    has_big[np.unique(lab[big[lab1]])] = True
+    covered = np.bincount(lab[m].ravel(), minlength=n)
+    hit = (covered >= GIANT_MIN_COVER * np.maximum(st[:, 4], 1)) & has_big
+    hit[0] = False
+    add = hit[lab]
+    d = 2 * GIANT_DARK_DEPTH + 1
+    dark = (rgb.mean(2) < 80).astype(np.uint8)
+    add &= ~(cv2.erode(dark, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))) > 0)
+    out = prob.copy()
+    out[add] = np.maximum(prob[add], half[add])
+    return out
+
+
+def fill_bodies(labels, regions, rgb):
+    """Fills the white body of giant letters from the page itself. A white area is a letter body when the mask traces
+    most of the line around it. Holes inside a filled body are counters and keep showing the art. Halftone whites and
+    grids of same-size squares (windows, tiles) are skipped. Each body joins the region of the line around it."""
+    H, W = labels.shape
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    n, lab, st, _ = cv2.connectedComponentsWithStats((g >= BODY_BRIGHT).astype(np.uint8), connectivity=4)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BODY_REACH, BODY_REACH))
+    near = cv2.dilate((labels > 0).astype(np.uint8), k) > 0
+    amin, amax = (H * BODY_MIN_SIDE) ** 2, BODY_MAX_AREA * H * W
+    blocked = np.zeros((H, W), bool)
+    cells = []
+    for i in sorted((i for i in range(1, n) if amin <= st[i, 4] <= amax), key=lambda i: -st[i, 4]):
+        x, y, w, h, a = st[i]
+        c = lab[y:y + h, x:x + w] == i
+        if (blocked[y:y + h, x:x + w] & c).any():
+            continue
+        cs, _ = cv2.findContours(c.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        q = max(cs, key=len)[:, 0]
+        px, py = q[:, 0] + x, q[:, 1] + y
+        inside = (px > 0) & (py > 0) & (px < W - 1) & (py < H - 1)  # the edge of the page is nobody's line
+        if inside.sum() < 20 or near[py[inside], px[inside]].mean() < BODY_RING:
+            continue
+        hull = np.zeros((h, w), np.uint8)
+        cv2.drawContours(hull, cs, -1, 1, -1)
+        _, _, hs, _ = cv2.connectedComponentsWithStats(((hull > 0) & ~c).astype(np.uint8), connectivity=8)
+        if (hs[1:, 4] < 400).sum() * 1e4 / a > BODY_DOTS:
+            continue
+        blocked[y:y + h, x:x + w] |= (hull > 0) & ~c
+        cells.append((i, x, y, w, h))
+    square = [c for c in cells if min(c[3], c[4]) > 0.8 * max(c[3], c[4])]
+    drop = set()
+    for c in square:
+        same = [j for j in square if abs(j[3] - c[3]) <= 0.2 * max(j[3], c[3]) and abs(j[4] - c[4]) <= 0.2 * max(j[4], c[4])]
+        if len(same) >= BODY_GRID:
+            drop.update(j[0] for j in same)
+    cells = [c for c in cells if c[0] not in drop]
+    if not cells:
+        return labels, regions
+    labels = labels.copy()
+    by_id = {r["id"]: r for r in regions}
+    for i, x, y, w, h in cells:
+        X0, Y0, X1, Y1 = max(0, x - BODY_REACH), max(0, y - BODY_REACH), min(W, x + w + BODY_REACH), min(H, y + h + BODY_REACH)
+        body = lab[Y0:Y1, X0:X1] == i
+        around = labels[Y0:Y1, X0:X1][cv2.dilate(body.astype(np.uint8), k) > 0]
+        around = around[around > 0]
+        if not around.size:
+            continue
+        rid = int(np.bincount(around).argmax())
+        new = body & (labels[Y0:Y1, X0:X1] == 0)
+        labels[Y0:Y1, X0:X1][new] = rid
+        r = by_id[rid]
+        r["area"] += int(new.sum())
+        r["box"] = [min(r["box"][0], int(x)), min(r["box"][1], int(y)), max(r["box"][2], int(x + w)), max(r["box"][3], int(y + h))]
+    return labels, regions
 
 
 def _group(st, keep, gap=0.7, max_gap=None):
@@ -159,8 +257,28 @@ def find_regions(prob, threshold=0.5, confident=0.8, min_area=12, min_region_are
     return labels, regions
 
 
+def download_shin3(path=SHIN3_MODEL):
+    """Fetches Shin3 from the project's GitHub release, and keeps it only if its checksum matches."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    print(f"downloading Shin3 (29 MB) from {SHIN3_URL}")
+    part = path + ".part"
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(SHIN3_URL) as r, open(part, "wb") as f:
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            digest.update(chunk)
+    if digest.hexdigest() != SHIN3_SHA256:
+        os.remove(part)
+        raise RuntimeError(f"the download does not match Shin3; get it by hand from {SHIN3_URL} into {path}")
+    os.replace(part, path)
+
+
 class MangaTextMask:
     def __init__(self, model_path=DEFAULT_MODEL, providers=None):
+        """model_path: "shin1", "shin2", "shin3", or the path of an .onnx file."""
+        model_path = MODELS.get(str(model_path).lower(), model_path)
+        if model_path == SHIN3_MODEL and not os.path.exists(model_path):
+            download_shin3(model_path)
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(model_path, options, providers=providers or available_providers())
@@ -170,6 +288,7 @@ class MangaTextMask:
         self.confident = float(settings.get("confident", 0.8))
         self.wide_page_max_height = int(settings.get("wide_page_max_height", 0))
         self.wide_page_min_width = int(settings.get("wide_page_min_width", 0))
+        self.giant = settings.get("giant", "0") == "1"
 
     @property
     def backend(self):
@@ -224,7 +343,18 @@ class MangaTextMask:
         prob = 1 / (1 + np.exp(-logit))
         if s != 1:
             prob = cv2.resize(prob, (W, H), interpolation=cv2.INTER_LINEAR)
-        return fill_hollow(prob, rgb)
+        prob = fill_hollow(prob, rgb)
+        if self.giant:
+            prob = merge_giant(prob, self._half_size(rgb), rgb)
+        return prob
+
+    def _half_size(self, rgb):
+        """The page at GIANT_SCALE of its working height, in one piece, brought back to the page's size."""
+        H, W = rgb.shape[:2]
+        h = float(np.clip(H, MIN_HEIGHT, MAX_HEIGHT)) * GIANT_SCALE
+        small = cv2.resize(rgb, (max(32, round(W * h / H)), max(32, round(h))), interpolation=cv2.INTER_AREA)
+        prob = 1 / (1 + np.exp(-self._logits(small)))
+        return cv2.resize(prob, (W, H), interpolation=cv2.INTER_LINEAR)
 
     def detect(self, rgb, threshold=0.5, grow=0, tile=None):
         """Returns (mask, labels, regions).
@@ -234,6 +364,8 @@ class MangaTextMask:
         grow: expand the mask and the labels outward by this many px, so no dark edge survives cleaning.
         Boxes, areas and scores describe the regions before growing."""
         labels, regions = find_regions(self.probabilities(rgb, tile), threshold, self.confident)
+        if self.giant:
+            labels, regions = fill_bodies(labels, regions, rgb)
         if grow:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
             labels = cv2.dilate(labels.astype(np.float32), k).astype(np.int32)
@@ -259,8 +391,8 @@ def main():
     ap.add_argument("pages", nargs="+", help="image files; wildcards are fine")
     ap.add_argument("-o", "--out", default="out", help="output folder (default: out)")
     which = ap.add_mutually_exclusive_group()
-    which.add_argument("--precise", action="store_true", help="use the second model: fewer false detections, less of each giant effect")
-    which.add_argument("--model", default=DEFAULT_MODEL, help="path to the .onnx file")
+    which.add_argument("--model", default="shin1", help="shin1 (default), shin2, shin3, or the path of an .onnx file")
+    which.add_argument("--precise", action="store_true", help="same as --model shin2")
     ap.add_argument("--threshold", type=float, default=0.5, help="lower finds more and also marks more art (default: 0.5)")
     ap.add_argument("--grow", type=int, default=0, help="expand the mask outward by N px; 2 suits cleaning (default: 0)")
     ap.add_argument("--tile", type=int, default=None, help="force tiles of N px; try 1536 if the GPU runs out of memory")
@@ -272,7 +404,7 @@ def main():
     a = ap.parse_args()
 
     pages = [p for spec in a.pages for p in (sorted(glob.glob(spec)) or [spec])]
-    model = MangaTextMask(PRECISE_MODEL if a.precise else a.model, ["CPUExecutionProvider"] if a.cpu else None)
+    model = MangaTextMask("shin2" if a.precise else a.model, ["CPUExecutionProvider"] if a.cpu else None)
     print(f"running on {model.backend}")
     os.makedirs(a.out, exist_ok=True)
     for path in pages:
